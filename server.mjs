@@ -1,501 +1,614 @@
-// server.mjs
+/**
+ * server.mjs
+ *
+ * Tiny Render-ready Express app for submitting batch Seedream v4 jobs
+ * and archiving results to Airtable.
+ *
+ * Install:
+ *   npm install express node-fetch
+ *
+ * Required env vars:
+ *   AIRTABLE_BASE_ID    e.g. app...
+ *   AIRTABLE_TABLE      e.g. tbl...
+ *   AIRTABLE_TOKEN      Airtable PAT with read+write to that base
+ *   WAVESPEED_API_KEY   WaveSpeed API key for Seedream v4
+ *   PUBLIC_BASE_URL     e.g. https://your-app.onrender.com  (used for webhook URLs)
+ *
+ * Important: adapt WAVESPEED_* endpoints/JSON if your provider's spec differs.
+ */
+
 import express from "express";
-import fetch from "node-fetch"; // If Node 18+, global fetch exists; node-fetch is safe fallback.
-import dotenv from "dotenv";
-import bodyParser from "body-parser";
+import fetch from "node-fetch";
+import { Buffer } from "buffer";
 import crypto from "crypto";
-import { URL } from "url";
-import { setTimeout as wait } from "timers/promises";
-
-dotenv.config();
-
-const {
-  PORT = 3000,
-  PUBLIC_BASE_URL = "http://localhost:3000",
-  WAVESPEED_API_KEY,
-  WAVESPEED_API_BASE = "https://api.wavespeed.example/v4", // replace with real base
-  AIRTABLE_TOKEN,
-  AIRTABLE_BASE_ID,
-  AIRTABLE_TABLE,
-} = process.env;
-
-if (!WAVESPEED_API_KEY || !AIRTABLE_TOKEN || !AIRTABLE_BASE_ID || !AIRTABLE_TABLE) {
-  console.warn("Warning: One or more environment variables are missing. See README in comments.");
-}
 
 const app = express();
-app.use(bodyParser.json({ limit: "10mb" }));
-app.use(bodyParser.urlencoded({ extended: true, limit: "10mb" }));
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: "20mb" }));
 
-// Simple HTML UI at /app
+/* ---------- Config ---------- */
+const {
+  AIRTABLE_BASE_ID,
+  AIRTABLE_TABLE,
+  AIRTABLE_TOKEN,
+  WAVESPEED_API_KEY,
+  PUBLIC_BASE_URL = "",
+  PORT = 3000,
+} = process.env;
+
+if (!AIRTABLE_BASE_ID || !AIRTABLE_TABLE || !AIRTABLE_TOKEN || !WAVESPEED_API_KEY) {
+  console.error("Missing required env vars. Please set AIRTABLE_BASE_ID, AIRTABLE_TABLE, AIRTABLE_TOKEN, WAVESPEED_API_KEY");
+  process.exit(1);
+}
+
+const AIRTABLE_API_ROOT = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_TABLE}`;
+const AIRTABLE_META = `https://api.airtable.com/v0/meta/bases/${AIRTABLE_BASE_ID}/tables`;
+const WAVESPEED_SUBMIT_URL = "https://api.wavespeed.ai/v1/seedream/generate"; // <-- adapt if different
+const WAVESPEED_POLL_URL = "https://api.wavespeed.ai/v1/requests"; // GET /requests/{id} assumed
+
+/* ---------- Helpers ---------- */
+
+const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+
+async function fetchImageAsDataURL(url) {
+  // fetch remote image and return data URL (base64)
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Failed to fetch ${url}: ${res.status}`);
+  const buffer = await res.arrayBuffer();
+  const mime = res.headers.get("content-type") || "application/octet-stream";
+  const b64 = Buffer.from(buffer).toString("base64");
+  return `data:${mime};base64,${b64}`;
+}
+
+async function airtableCreateRow(fields) {
+  const body = { records: [{ fields }] };
+  const res = await fetch(AIRTABLE_API_ROOT, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${AIRTABLE_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`Airtable create failed: ${res.status} ${txt}`);
+  }
+  const data = await res.json();
+  return data.records[0];
+}
+
+async function airtableUpdateRecord(recordId, fields) {
+  const url = `${AIRTABLE_API_ROOT}/${recordId}`;
+  const res = await fetch(url, {
+    method: "PATCH",
+    headers: {
+      Authorization: `Bearer ${AIRTABLE_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ fields }),
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`Airtable update failed: ${res.status} ${txt}`);
+  }
+  return res.json();
+}
+
+function genId(prefix = "run") {
+  return `${prefix}_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`;
+}
+
+/* ---------- WaveSpeed helpers (assumptions - adapt if your API differs) ---------- */
+
+/**
+ * submitToWaveSpeed(dataURLs, prompt, size)
+ * - dataURLs: [subjectDataURL, ref1DataURL, ref2DataURL...]
+ * - returns { requestId }
+ *
+ * NOTE: adapt the request body structure to your Seedream v4 API.
+ */
+async function submitToWaveSpeed({ dataURLs, prompt, width, height, model = "seedream-v4" }) {
+  // sample payload - adjust to your API
+  const payload = {
+    model,
+    prompt,
+    images: dataURLs, // subject first, refs after
+    width,
+    height,
+    // other generation options can be added here
+    webhook: `${PUBLIC_BASE_URL.replace(/\/$/, "")}/webhooks/wavespeed`,
+    // optional: add a client-provided meta id to help match callbacks
+    client_meta: { submitted_at: new Date().toISOString() },
+  };
+
+  const res = await fetch(WAVESPEED_SUBMIT_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${WAVESPEED_API_KEY}`,
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`WaveSpeed submit failed: ${res.status} ${txt}`);
+  }
+  const json = await res.json();
+  // expected: { request_id: "..." } or similar
+  // adapt field name if necessary
+  const requestId = json.request_id || json.id || json.requestId || json.requestID;
+  if (!requestId) throw new Error("WaveSpeed response did not include a request id. Response: " + JSON.stringify(json));
+  return { requestId, raw: json };
+}
+
+/**
+ * pollWaveSpeedStatus(requestId)
+ * - returns { status: 'processing'|'completed'|'failed', outputs: [url...], info: raw }
+ * 
+ * If your API uses a different endpoint/shape, adapt here.
+ */
+async function pollWaveSpeedStatus(requestId) {
+  const url = `${WAVESPEED_POLL_URL}/${encodeURIComponent(requestId)}`;
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${WAVESPEED_API_KEY}`, "Content-Type": "application/json" },
+  });
+  if (res.status === 404) {
+    return { status: "failed", outputs: [], info: { error: "not_found" } };
+  }
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`WaveSpeed poll failed: ${res.status} ${txt}`);
+  }
+  const json = await res.json();
+  // expected shape: { status: 'succeeded'|'processing'|'failed', outputs: [{ url }] }
+  const statusRaw = (json.status || "").toLowerCase();
+  let status = "processing";
+  if (statusRaw === "succeeded" || statusRaw === "completed" || statusRaw === "done") status = "completed";
+  if (statusRaw === "failed" || statusRaw === "error") status = "failed";
+  // Try to extract output URLs
+  const outputs = [];
+  if (Array.isArray(json.outputs)) {
+    for (const o of json.outputs) {
+      if (o.url) outputs.push(o.url);
+      else if (o.uri) outputs.push(o.uri);
+      else if (o.b64) {
+        // If it's base64, we cannot attach directly to Airtable; would need to host it.
+        // We'll encode as data URL; note Airtable may not accept data: URLs for attachments.
+        outputs.push(`data:image/png;base64,${o.b64}`);
+      }
+    }
+  }
+  return { status, outputs, info: json };
+}
+
+/* ---------- Reliability helpers: retries + backoff ---------- */
+
+async function retry(fn, { retries = 5, baseMs = 500, factor = 1.8 } = {}) {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await fn(attempt);
+    } catch (err) {
+      attempt++;
+      if (attempt > retries) throw err;
+      const wait = Math.round(baseMs * Math.pow(factor, attempt - 1));
+      console.warn(`Retry ${attempt}/${retries} after err: ${err.message}. Waiting ${wait}ms`);
+      await sleep(wait);
+    }
+  }
+}
+
+/* ---------- In-memory index (short-lived) ---------- */
+/* We also persist to Airtable so this is just an accelerator during runtime. */
+
+const inFlightRequests = new Map(); // requestId => { airtableRecordId, batchRunId }
+
+/* ---------- /app form (simple) ---------- */
+
+app.get("/", (req, res) => res.send("OK"));
 app.get("/app", (req, res) => {
-  res.type("html").send(`<!doctype html>
+  res.send(`<!doctype html>
   <html>
-  <head><meta charset="utf-8"><title>WaveSpeed Batch Runner</title></head>
-  <body style="font-family:system-ui, -apple-system, sans-serif; padding:2rem">
-    <h1>WaveSpeed Batch Runner</h1>
-    <form method="POST" action="/start-batch">
-      <label>Prompt<br><textarea name="prompt" rows="3" cols="60" required></textarea></label><br><br>
-      <label>Subject Image URL<br><input name="subjectUrl" type="url" style="width:60%" required /></label><br><br>
-      <label>Reference Image URLs (comma-separated)<br><input name="refUrls" type="text" style="width:60%" /></label><br><br>
-      <label>Width <input name="width" type="number" value="512" /></label>
-      <label>Height <input name="height" type="number" value="512" /></label><br><br>
-      <label>Batch Count <input name="batchCount" type="number" value="3" min="1" /></label><br><br>
-      <button type="submit">Start Batch</button>
+  <head>
+    <meta charset="utf-8" />
+    <title>Seedream Batch</title>
+    <style>
+      body{font-family:system-ui,Segoe UI,Roboto;max-width:900px;margin:24px auto;padding:12px}
+      label{display:block;margin-top:12px}
+      input[type=text], textarea {width:100%;padding:8px;border-radius:6px;border:1px solid #ddd}
+      .row{display:flex;gap:10px}
+      .col{flex:1}
+      button{margin-top:12px;padding:10px 16px;border-radius:8px;border:0;background:#2563eb;color:#fff}
+    </style>
+  </head>
+  <body>
+    <h1>Seedream Batch</h1>
+    <form method="POST" action="/generate-batch">
+      <label>Prompt<textarea name="prompt" rows="4" required></textarea></label>
+      <label>Subject image URL<input type="text" name="subject" required placeholder="https://..." /></label>
+      <label>Reference image URLs (comma separated)<input type="text" name="refs" placeholder="https://..., https://..." /></label>
+      <div class="row">
+        <div class="col"><label>Width<input type="text" name="width" placeholder="2227" /></label></div>
+        <div class="col"><label>Height<input type="text" name="height" placeholder="3961" /></label></div>
+      </div>
+      <label>Batch count<input type="text" name="batch" value="4" /></label>
+      <label>Model<input type="text" name="model" placeholder="seedream-v4" /></label>
+      <button type="submit">Generate</button>
     </form>
-    <p>Webhook URL: <code>${PUBLIC_BASE_URL}/webhooks/wavespeed</code></p>
+    <p style="font-size:12px;color:#666">This server will create one Airtable row per batch and track outputs.</p>
   </body>
   </html>`);
 });
 
-/**
- * Utilities
- */
+/* ---------- /generate-batch handler ---------- */
 
-// Basic exponential backoff helper
-async function retryWithBackoff(fn, attempts = 3, initialDelayMs = 500) {
-  let lastErr;
-  let delay = initialDelayMs;
-  for (let i = 0; i < attempts; i++) {
-    try {
-      return await fn();
-    } catch (err) {
-      lastErr = err;
-      if (i < attempts - 1) {
-        await wait(delay);
-        delay *= 2;
-      }
+app.post("/generate-batch", async (req, res) => {
+  try {
+    const prompt = (req.body.prompt || "").trim();
+    const subjectUrl = (req.body.subject || "").trim();
+    const refsRaw = (req.body.refs || "").trim();
+    const width = parseInt(req.body.width, 10) || undefined;
+    const height = parseInt(req.body.height, 10) || undefined;
+    const batch = Math.max(1, Math.min(50, parseInt(req.body.batch, 10) || 4));
+    const model = req.body.model || "seedream-v4";
+
+    if (!prompt || !subjectUrl) return res.status(400).send("Prompt + subject required.");
+
+    // build data URLs for subject and refs (subject first)
+    const refUrls = refsRaw ? refsRaw.split(",").map(s => s.trim()).filter(Boolean) : [];
+    const allImageUrls = [subjectUrl, ...refUrls];
+
+    // Fetch and convert to data URLs with retries
+    const dataURLs = [];
+    for (const src of allImageUrls) {
+      const dataUrl = await retry(() => fetchImageAsDataURL(src), { retries: 3 });
+      dataURLs.push(dataUrl);
     }
-  }
-  throw lastErr;
-}
 
-function nowIso() {
-  return new Date().toISOString();
-}
+    // Create parent Airtable row for this batch
+    const runId = genId("run");
+    const createdAt = new Date().toISOString();
+    const initialFields = {
+      Prompt: prompt,
+      "Status": "processing",
+      "Model": model,
+      "Size": `${width || ""}x${height || ""}`,
+      "Request IDs": "", // will fill
+      "Seen IDs": "",
+      "Failed IDs": "",
+      "Run ID": runId,
+      "Created at": createdAt,
+      "Last Update": createdAt,
+    };
+    const airtableRecord = await airtableCreateRow(initialFields);
+    const airtableRecordId = airtableRecord.id;
 
-function makeRunId() {
-  return crypto.randomBytes(6).toString("hex");
-}
+    // Prepare to submit N jobs, spacing them ~1200ms
+    const requestIds = [];
+    const seenIds = [];
+    const failedIds = [];
 
-// Airtable helpers
-const AIRTABLE_BASE = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}`;
-const AIRTABLE_HEADERS = {
-  Authorization: `Bearer ${AIRTABLE_TOKEN}`,
-  "Content-Type": "application/json",
-};
-
-async function createAirtableRecord(fields) {
-  const url = `${AIRTABLE_BASE}/${encodeURIComponent(AIRTABLE_TABLE)}`;
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: AIRTABLE_HEADERS,
-    body: JSON.stringify({ fields }),
-  });
-  if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`Airtable create failed: ${resp.status} ${text}`);
-  }
-  const data = await resp.json();
-  return data;
-}
-
-async function updateAirtableRecord(recordId, fields) {
-  const url = `${AIRTABLE_BASE}/${encodeURIComponent(AIRTABLE_TABLE)}/${recordId}`;
-  const resp = await fetch(url, {
-    method: "PATCH",
-    headers: AIRTABLE_HEADERS,
-    body: JSON.stringify({ fields }),
-  });
-  if (!resp.ok) {
-    const txt = await resp.text();
-    throw new Error(`Airtable update failed: ${resp.status} ${txt}`);
-  }
-  return resp.json();
-}
-
-async function getAirtableRecord(recordId) {
-  const url = `${AIRTABLE_BASE}/${encodeURIComponent(AIRTABLE_TABLE)}/${recordId}`;
-  const resp = await fetch(url, { headers: AIRTABLE_HEADERS });
-  if (!resp.ok) {
-    const txt = await resp.text();
-    throw new Error(`Airtable get failed: ${resp.status} ${txt}`);
-  }
-  return resp.json();
-}
-
-// Convert remote image URL to data URL (base64)
-async function urlToDataUrl(imageUrl) {
-  // Validate
-  new URL(imageUrl); // will throw if invalid
-  return await retryWithBackoff(
-    async () => {
-      const resp = await fetch(imageUrl);
-      if (!resp.ok) throw new Error(`Failed fetch image ${imageUrl}: ${resp.status}`);
-      const buf = Buffer.from(await resp.arrayBuffer());
-      // Try to infer content-type from headers or extension
-      let contentType = resp.headers.get("content-type") || undefined;
-      if (!contentType) {
-        // fallback by extension
-        const ext = imageUrl.split(".").pop().toLowerCase();
-        if (ext === "jpg" || ext === "jpeg") contentType = "image/jpeg";
-        else if (ext === "png") contentType = "image/png";
-        else if (ext === "webp") contentType = "image/webp";
-        else contentType = "application/octet-stream";
-      }
-      return `data:${contentType};base64,${buf.toString("base64")}`;
-    },
-    3,
-    400
-  );
-}
-
-/**
- * WaveSpeed API helpers
- *
- * NOTE: Update endpoints/JSON shape to match your real WaveSpeed/Seedream v4 API.
- */
-
-async function submitWaveSpeedJob({ prompt, subjectDataUrl, refDataUrls = [], width, height, webhookUrl }) {
-  // Build payload expected by WaveSpeed Seedream v4. Adjust to API contract as needed.
-  const endpoint = `${WAVESPEED_API_BASE}/seedream/generate`;
-  const payload = {
-    model: "seedream-v4",
-    prompt,
-    images: [subjectDataUrl, ...refDataUrls], // subject first per your requirement
-    width,
-    height,
-    webhook: webhookUrl,
-  };
-
-  const res = await retryWithBackoff(
-    async () => {
-      const r = await fetch(endpoint, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${WAVESPEED_API_KEY}`,
-        },
-        body: JSON.stringify(payload),
-      });
-      if (!r.ok) {
-        const t = await r.text();
-        throw new Error(`WaveSpeed submit failed: ${r.status} ${t}`);
-      }
-      return r.json();
-    },
-    3,
-    500
-  );
-
-  // Assume response contains { requestId: '...' } or similar. Adapt if needed.
-  if (!res.requestId && !res.id) {
-    throw new Error("WaveSpeed response missing requestId/id: " + JSON.stringify(res));
-  }
-  // Normalize
-  return { requestId: res.requestId || res.id, raw: res };
-}
-
-async function fetchWaveSpeedResult(requestId) {
-  const endpoint = `${WAVESPEED_API_BASE}/seedream/requests/${encodeURIComponent(requestId)}`;
-  const r = await retryWithBackoff(
-    async () => {
-      const resp = await fetch(endpoint, {
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${WAVESPEED_API_KEY}`,
-        },
-      });
-      if (!resp.ok) {
-        const t = await resp.text();
-        throw new Error(`WaveSpeed fetch failed: ${resp.status} ${t}`);
-      }
-      return resp.json();
-    },
-    3,
-    500
-  );
-  return r; // Expect this to include status, outputs (maybe base64 or urls), etc.
-}
-
-/**
- * Helpers to manage parent row fields (strings join/split)
- */
-function csvAdd(csvStr, value) {
-  if (!csvStr || csvStr === "") return value;
-  const arr = csvStr.split(",").map((s) => s.trim()).filter(Boolean);
-  if (!arr.includes(value)) arr.push(value);
-  return arr.join(",");
-}
-
-function csvAppendAll(csvStr, values = []) {
-  const arr = (csvStr || "").split(",").map((s) => s.trim()).filter(Boolean);
-  for (const v of values) if (!arr.includes(v)) arr.push(v);
-  return arr.join(",");
-}
-
-/**
- * Main batch start handler
- */
-app.post("/start-batch", express.urlencoded({ extended: true }), async (req, res) => {
-  (async () => {
-    try {
-      const { prompt, subjectUrl, refUrls = "", width = "512", height = "512", batchCount = "1" } = req.body;
-      const w = parseInt(width || "512", 10);
-      const h = parseInt(height || "512", 10);
-      const count = Math.max(1, Math.min(50, parseInt(batchCount || "1", 10)));
-
-      const refList = refUrls
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean);
-
-      // Convert images to data URLs (subject first)
-      const subjectDataUrl = await urlToDataUrl(subjectUrl);
-      const refDataUrls = [];
-      for (const ru of refList) {
-        refDataUrls.push(await urlToDataUrl(ru));
-      }
-
-      // Create parent row in Airtable
-      const runId = makeRunId();
-      const initialFields = {
-        Prompt: prompt,
-        Subject: [{ url: subjectUrl }], // keep original URL as attachment as well
-        References: refList.map((u) => ({ url: u })),
-        Output: [], // attachments appended as jobs complete
-        "Output URL": "",
-        Model: "seedream-v4",
-        Size: `${w}x${h}`,
-        "Request IDs": "", // will populate as comma-separated
-        "Seen IDs": "",
-        "Failed IDs": "",
-        Status: "processing",
-        "Run ID": runId,
-        "Created At": nowIso(),
-        "Last Update": nowIso(),
+    for (let i = 0; i < batch; i++) {
+      // Each job gets same prompt + images. Optionally you could randomize or add guidance per job.
+      const attemptSubmit = async () => {
+        const { requestId } = await submitToWaveSpeed({
+          dataURLs,
+          prompt,
+          width,
+          height,
+          model,
+        });
+        return requestId;
       };
 
-      const created = await createAirtableRecord(initialFields);
-      const parentRecordId = created.id;
-      console.log(`Created parent Airtable record ${parentRecordId} for run ${runId}`);
-
-      // Start submitting jobs spaced by ~1.2s
-      for (let i = 0; i < count; i++) {
-        // delay between submissions to avoid API hiccups
-        if (i > 0) await wait(1200);
-
-        // submit one job
-        try {
-          const job = await submitWaveSpeedJob({
-            prompt,
-            subjectDataUrl,
-            refDataUrls,
-            width: w,
-            height: h,
-            webhookUrl: `${PUBLIC_BASE_URL}/webhooks/wavespeed`,
-          });
-          const requestId = job.requestId;
-          console.log(`Submitted job ${i + 1}/${count}: ${requestId}`);
-
-          // add Request ID to Airtable immediately
-          await updateAirtableRecord(parentRecordId, {
-            "Request IDs": csvAdd((created.fields?.["Request IDs"]) || "", requestId),
-            "Last Update": nowIso(),
-          });
-
-          // Kick off polling in background (no await so multiple pollers run)
-          pollUntilDone(requestId, parentRecordId).catch((err) => {
-            console.error("pollUntilDone error:", err);
-          });
-        } catch (err) {
-          console.error("Error submitting job:", err);
-          // If submission fails, record this ID-less failure in Failed IDs by creating a placeholder token
-          const failToken = `submit-failure-${Date.now()}-${i}`;
-          await updateAirtableRecord(parentRecordId, {
-            "Failed IDs": csvAdd((created.fields?.["Failed IDs"]) || "", failToken),
-            "Last Update": nowIso(),
-          });
-        }
+      // Retry submit with backoff
+      try {
+        const requestId = await retry(() => attemptSubmit(), { retries: 4, baseMs: 600 });
+        requestIds.push(requestId);
+        // cache association for poller and webhooks
+        inFlightRequests.set(requestId, { airtableRecordId, runId });
+      } catch (err) {
+        console.error("Submit failed for one job:", err.message);
+        // record "failed" request (no requestId)
+        const pseudoId = `submit_failed_${i}_${Date.now()}`;
+        failedIds.push(pseudoId);
       }
 
-      // Response to user: parent record created and batch started
-      res.type("json").send({ ok: true, parentRecordId, runId, message: "Batch submitted. Running in background." });
-    } catch (err) {
-      console.error("start-batch error", err);
-      try {
-        res.status(500).json({ ok: false, error: err.message });
-      } catch {}
+      // spacing to avoid rate limits
+      await sleep(1200);
     }
-  })();
+
+    // Update Airtable row with Request IDs
+    const now = new Date().toISOString();
+    await airtableUpdateRecord(airtableRecordId, {
+      "Request IDs": requestIds.join(","),
+      "Seen IDs": seenIds.join(","),
+      "Failed IDs": failedIds.join(","),
+      "Last Update": now,
+    });
+
+    // Immediately respond with run info and Airtable row link (if PUBLIC_BASE_URL present)
+    const appUrl = PUBLIC_BASE_URL ? `${PUBLIC_BASE_URL.replace(/\/$/, "")}/app` : "";
+    res.send({
+      ok: true,
+      airtableRecordId,
+      runId,
+      requestIds,
+      preview: appUrl,
+      message: "Batch submitted; Airtable row created with Status=processing.",
+    });
+  } catch (err) {
+    console.error("generate-batch err:", err);
+    res.status(500).send({ error: err.message });
+  }
 });
 
-/**
- * Polling: pollUntilDone(requestId, parentId)
- * Polls every 7s (with retries), times out after ~20 minutes
- */
-async function pollUntilDone(requestId, parentRecordId) {
-  console.log(`pollUntilDone started for ${requestId}`);
-  const pollIntervalMs = 7000;
-  const timeoutMs = 20 * 60 * 1000; // 20 minutes
-  const start = Date.now();
+/* ---------- Webhook receiver for WaveSpeed callbacks ---------- */
+/* Expected payload (example):
+   {
+     request_id: "...",
+     status: "succeeded"|"failed"|"processing",
+     outputs: [{ url: "..."}]
+   }
+   Adapt if your provider sends different shape.
+*/
 
-  while (Date.now() - start < timeoutMs) {
-    try {
-      const res = await fetchWaveSpeedResult(requestId);
-      // Expected shape: { status: 'processing'|'completed'|'failed', outputs: [ {url:..., base64:...} ], ... }
-      const status = res.status || res.state || res.resultStatus;
-      if (status === "completed" || status === "succeeded") {
-        console.log(`Job ${requestId} completed (polled)`);
-        await handleWaveSpeedResultPayload({ requestId, payload: res }, parentRecordId);
-        return res;
-      } else if (status === "failed" || status === "error") {
-        console.log(`Job ${requestId} failed (polled)`);
-        await markRequestFailed(parentRecordId, requestId, `polled-failure`);
-        return res;
-      } else {
-        // still processing
-        // optionally we can update Last Update in Airtable
-        await updateAirtableRecord(parentRecordId, { "Last Update": nowIso() });
-      }
-    } catch (err) {
-      console.warn(`Error polling ${requestId}: ${err.message}`);
-    }
-    await wait(pollIntervalMs);
-  }
-
-  // timed out
-  console.warn(`Job ${requestId} timed out after ${timeoutMs / 1000} seconds`);
-  await markRequestFailed(parentRecordId, requestId, "timeout");
-  return { status: "timeout" };
-}
-
-/**
- * Mark a request as failed (append to Failed IDs and update Last Update)
- */
-async function markRequestFailed(parentRecordId, requestId, reason = "") {
+app.post("/webhooks/wavespeed", async (req, res) => {
   try {
-    const parent = await getAirtableRecord(parentRecordId);
-    const currentFailed = (parent.fields?.["Failed IDs"]) || "";
-    const currentLastUpdate = nowIso();
-    const updatedFailed = csvAdd(currentFailed, requestId + (reason ? `:${reason}` : ""));
-    // Also mark Seen IDs? no — not seen; leave Request ID in Request IDs.
-    await updateAirtableRecord(parentRecordId, {
-      "Failed IDs": updatedFailed,
-      "Last Update": currentLastUpdate,
-    });
-    // After updating failed, check completion
-    await tryFinalizeParent(parentRecordId);
-  } catch (err) {
-    console.error("markRequestFailed error:", err);
-  }
-}
-
-/**
- * Append output attachments and mark Seen IDs when result arrives (either webhook or poll)
- * Expects payload that may contain outputs in one of multiple forms:
- * - payload.outputs: [{ url }] OR
- * - payload.outputs: [{ base64, filename }]
- * - Or payload may include direct image URLs
- */
-async function handleWaveSpeedResultPayload({ requestId, payload }, parentRecordId) {
-  try {
-    // Pull parent row
-    const parent = await getAirtableRecord(parentRecordId);
-    const outputsField = parent.fields?.Output || [];
-    const currentSeen = parent.fields?.["Seen IDs"] || "";
-    const currentOutputUrls = parent.fields?.["Output URL"] || "";
-
-    // Normalize outputs — try to extract known forms
-    let attachmentsToAdd = []; // array of {url: ...} to add to Airtable
-    // If payload has direct urls
-    if (Array.isArray(payload.outputs) && payload.outputs.length > 0) {
-      for (const o of payload.outputs) {
-        if (o.url) {
-          attachmentsToAdd.push({ url: o.url });
-        } else if (o.base64) {
-          // Attach base64 data URL
-          const filename = o.filename || `${requestId}.png`;
-          const dataUrl = o.base64.startsWith("data:") ? o.base64 : `data:image/png;base64,${o.base64}`;
-          attachmentsToAdd.push({ url: dataUrl, filename });
-        }
-      }
-    } else if (payload.result && Array.isArray(payload.result.images)) {
-      for (const img of payload.result.images) {
-        if (img.url) attachmentsToAdd.push({ url: img.url });
-        else if (img.base64) attachmentsToAdd.push({ url: img.base64.startsWith("data:") ? img.base64 : `data:image/png;base64,${img.base64}` });
-      }
-    } else if (payload.image) {
-      // single image
-      const img = payload.image;
-      if (img.url) attachmentsToAdd.push({ url: img.url });
-      else if (img.base64) attachmentsToAdd.push({ url: img.base64.startsWith("data:") ? img.base64 : `data:image/png;base64,${img.base64}` });
-    }
-
-    // If no attachments could be extracted, but payload contains a URL field
-    if (attachmentsToAdd.length === 0) {
-      if (payload.outputUrl) attachmentsToAdd.push({ url: payload.outputUrl });
-      else if (payload.url) attachmentsToAdd.push({ url: payload.url });
-    }
-
-    // Append new attachments to existing Output field for Airtable
-    const newOutputs = Array.isArray(outputsField) ? outputsField.concat(attachmentsToAdd) : attachmentsToAdd;
-
-    // Update Output and Seen IDs
-    const updatedSeen = csvAdd(currentSeen, requestId);
-    // If attachments include URLs, update Output URL to the last one (optional)
-    let newOutputUrl = currentOutputUrls;
-    if (attachmentsToAdd.length > 0) {
-      // Try pick first http(s) url to expose in Output URL (not data:)
-      const httpOne = attachmentsToAdd.find((a) => a.url && a.url.startsWith("http"));
-      if (httpOne) newOutputUrl = httpOne.url;
-    }
-
-    await updateAirtableRecord(parentRecordId, {
-      Output: newOutputs,
-      "Seen IDs": updatedSeen,
-      "Output URL": newOutputUrl,
-      "Last Update": nowIso(),
-    });
-
-    // After updating, try finalize parent
-    await tryFinalizeParent(parentRecordId);
-  } catch (err) {
-    console.error("handleWaveSpeedResultPayload error", err);
-  }
-}
-
-/**
- * Check whether Seen IDs == Request IDs (set completed) or if all requests listed as failed/seen.
- * If so, mark Status completed and set Completed At.
- */
-async function tryFinalizeParent(parentRecordId) {
-  try {
-    const parent = await getAirtableRecord(parentRecordId);
-    const reqCsv = (parent.fields?.["Request IDs"] || "").split(",").map((s) => s.trim()).filter(Boolean);
-    const seenCsv = (parent.fields?.["Seen IDs"] || "").split(",").map((s) => s.trim()).filter(Boolean);
-    const failedCsv = (parent.fields?.["Failed IDs"] || "").split(",").map((s) => s.trim()).filter(Boolean);
-
-    // If there are no Request IDs, treat as completed
-    if (reqCsv.length === 0) {
-      await updateAirtableRecord(parentRecordId, { Status: "completed", "Completed At": nowIso(), "Last Update": nowIso() });
+    const body = req.body || {};
+    // Accept either request_id or id
+    const requestId = body.request_id || body.id || body.requestId;
+    if (!requestId) {
+      res.status(400).send("Missing request_id");
       return;
     }
 
-    // If every request id is either in seen OR in failed (matching base ids; note failed entries may contain :reason)
-    const normalizedFailedIds = failedCsv.map((f) => f.split(":")[0]);
-    const allHandled = reqCsv.every((rid) => seenCsv.includes(rid) || normalizedFailedIds.includes(rid));
-    if (allHandled) {
-      await updateAirtableRecord(parentRecordId, { Status: "completed", "Completed At": nowIso(), "Last Update": nowIso() });
-      console.log(`Parent ${parentRecordId} marked completed`);
-    } else {
-      // still processing — update Last Update timestamp
-      await updateAirtableRecord(parentRecordId, { "Last Update": nowIso() });
+    const { status = "processing", outputs = [] } = body;
+    // find the associated Airtable row
+    const meta = inFlightRequests.get(requestId);
+    if (!meta) {
+      // we don't have it in memory; attempt to find Airtable row by searching 'Request IDs' field
+      // this is an expensive fallback but useful if server restarted
+      const rec = await findAirtableRecordByRequestId(requestId);
+      if (!rec) {
+        console.warn("Webhook for unknown requestId", requestId);
+        // still respond 200 so sender won't retry excessively
+        res.send({ ok: true });
+        return;
+      }
+      meta = { airtableRecordId: rec.id, runId: rec.fields["Run ID"] };
     }
+
+    const airtableRecordId = meta.airtableRecordId;
+
+    // Append outputs to Output field and set Output URL (first) maybe
+    const outputUrls = outputs.map(o => o.url || o.uri).filter(Boolean);
+
+    // Get existing record to merge fields
+    const currentRec = await fetch(`${AIRTABLE_API_ROOT}/${airtableRecordId}`, {
+      headers: { Authorization: `Bearer ${AIRTABLE_TOKEN}` },
+    }).then((r) => r.json());
+
+    const existingFields = currentRec.fields || {};
+    const existingOutputs = existingFields.Output || []; // Airtable attachment array
+    const existingOutputUrls = existingOutputs.map(x => x.url).filter(Boolean);
+
+    // Append new outputs
+    const attachmentsToAdd = outputUrls
+      .filter(u => !existingOutputUrls.includes(u))
+      .map(u => ({ url: u }));
+
+    // Build Seen IDs and Failed IDs updates
+    const prevSeen = (existingFields["Seen IDs"] || "").split(",").map(s => s.trim()).filter(Boolean);
+    const prevFailed = (existingFields["Failed IDs"] || "").split(",").map(s => s.trim()).filter(Boolean);
+    const prevRequestIds = (existingFields["Request IDs"] || "").split(",").map(s => s.trim()).filter(Boolean);
+
+    let newSeen = prevSeen.slice();
+    let newFailed = prevFailed.slice();
+
+    if (status === "completed" || status === "succeeded" || status === "done") {
+      newSeen.push(requestId);
+    } else if (status === "failed" || status === "error") {
+      newFailed.push(requestId);
+      newSeen.push(requestId);
+    } else {
+      // processing -> mark seen but not final
+      newSeen.push(requestId);
+    }
+
+    // Deduplicate
+    newSeen = Array.from(new Set(newSeen));
+    newFailed = Array.from(new Set(newFailed));
+
+    // If all Request IDs are seen or failed, mark run completed
+    const allRequestIds = prevRequestIds;
+    const allSeenOrFailed = allRequestIds.length > 0 && allRequestIds.every(id => newSeen.includes(id) || newFailed.includes(id));
+
+    const updateFields = {
+      "Seen IDs": newSeen.join(","),
+      "Failed IDs": newFailed.join(","),
+      "Last Update": new Date().toISOString(),
+    };
+
+    if (attachmentsToAdd.length) {
+      // Airtable attachments are provided in "Output" field as array of { url }
+      // We PATCH by setting Output to existing + attachmentsToAdd
+      updateFields["Output"] = [...existingOutputs, ...attachmentsToAdd];
+      // Also save first output URL into Output URL (useful quick-link)
+      const allOutputsFinal = [...existingOutputUrls, ...attachmentsToAdd.map(a => a.url)];
+      if (allOutputsFinal.length) updateFields["Output URL"] = allOutputsFinal[0];
+    }
+
+    if (allSeenOrFailed) {
+      updateFields["Status"] = "completed";
+      updateFields["Completed At"] = new Date().toISOString();
+    }
+
+    await airtableUpdateRecord(airtableRecordId, updateFields);
+
+    // remove from in-flight map if finished
+    if (allSeenOrFailed) {
+      allRequestIds.forEach(id => inFlightRequests.delete(id));
+    } else {
+      inFlightRequests.delete(requestId); // still remove this id so memory doesn't grow; poller will handle missing ones
+    }
+
+    res.send({ ok: true });
   } catch (err) {
-    console.error("tryFinalizeParent error", err);
+    console.error("webhook error", err);
+    // respond 200 anyway to avoid excessive retries unless you want retries
+    res.status(200).send({ ok: false, error: err.message });
+  }
+});
+
+/* ---------- Poller: periodically check requests that haven't been finalized ---------- */
+
+const POLL_INTERVAL_MS = 15_000; // 15s
+const MAX_POLL_ATTEMPTS = 20; // per request before marking failed (configurable)
+const requestPollInfo = new Map(); // requestId => { attempts, airtableRecordId, runId }
+
+async function findAirtableRecordByRequestId(requestId) {
+  // Search Airtable for Request IDs containing this requestId.
+  // This uses filterByFormula and may require escaping.
+  try {
+    const filter = encodeURIComponent(`FIND("${requestId}",{Request IDs})`);
+    const url = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_TABLE}?filterByFormula=${filter}`;
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${AIRTABLE_TOKEN}` } });
+    if (!res.ok) return null;
+    const json = await res.json();
+    if (Array.isArray(json.records) && json.records.length > 0) {
+      return json.records[0];
+    }
+    return null;
+  } catch (err) {
+    console.error("findAirtableRecordByRequestId err", err);
+    return null;
   }
 }
 
-/**
- * Webhook handler t*
+async function pollerLoop() {
+  try {
+    // Find Airtable rows in "processing" status with Request IDs
+    // We'll page through results (simple approach: single page up to 100 records)
+    const filter = encodeURIComponent(`{Status} = 'processing'`);
+    const url = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_TABLE}?pageSize=100&filterByFormula=${filter}`;
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${AIRTABLE_TOKEN}` } });
+    if (!res.ok) {
+      console.warn("Poller: failed to fetch processing rows", res.status);
+      return;
+    }
+    const json = await res.json();
+    const records = json.records || [];
+    for (const rec of records) {
+      const recId = rec.id;
+      const fields = rec.fields || {};
+      const reqIds = (fields["Request IDs"] || "").split(",").map(s => s.trim()).filter(Boolean);
+      const seen = (fields["Seen IDs"] || "").split(",").map(s => s.trim()).filter(Boolean);
+      const failed = (fields["Failed IDs"] || "").split(",").map(s => s.trim()).filter(Boolean);
+
+      for (const rid of reqIds) {
+        // If already seen or failed, skip
+        if (seen.includes(rid) || failed.includes(rid)) continue;
+
+        // poll each request
+        try {
+          const pollResp = await retry(() => pollWaveSpeedStatus(rid), { retries: 2, baseMs: 600 });
+          if (pollResp.status === "completed") {
+            // store outputs to Airtable
+            const outputs = pollResp.outputs || [];
+            const att = outputs.map(u => ({ url: u }));
+            const now = new Date().toISOString();
+
+            // Append attachments
+            const existingOutputs = (fields.Output || []).map(x => x.url).filter(Boolean);
+            const toAdd = att.filter(a => !existingOutputs.includes(a.url));
+            const updateFields = {
+              "Output": [...(fields.Output || []), ...toAdd],
+              "Output URL": (fields["Output URL"] || toAdd[0]?.url),
+              "Seen IDs": (fields["Seen IDs"] ? fields["Seen IDs"] + "," : "") + rid,
+              "Last Update": now,
+            };
+
+            // Are all done?
+            const newSeen = ((fields["Seen IDs"] || "").split(",").map(s => s.trim()).filter(Boolean)).concat([rid]);
+            const allSeenOrFailed = reqIds.every(id => newSeen.includes(id) || failed.includes(id));
+            if (allSeenOrFailed) {
+              updateFields["Status"] = "completed";
+              updateFields["Completed At"] = now;
+            }
+
+            await airtableUpdateRecord(recId, updateFields);
+
+            // remove from inFlightRequests
+            inFlightRequests.delete(rid);
+          } else if (pollResp.status === "failed") {
+            // mark as failed
+            const now = new Date().toISOString();
+            const updateFields = {
+              "Failed IDs": (fields["Failed IDs"] ? fields["Failed IDs"] + "," : "") + rid,
+              "Seen IDs": (fields["Seen IDs"] ? fields["Seen IDs"] + "," : "") + rid,
+              "Last Update": now,
+            };
+            // check complete
+            const newFailed = ((fields["Failed IDs"] || "").split(",").map(s => s.trim()).filter(Boolean)).concat([rid]);
+            const newSeen = ((fields["Seen IDs"] || "").split(",").map(s => s.trim()).filter(Boolean)).concat([rid]);
+            const allSeenOrFailed = reqIds.every(id => newSeen.includes(id) || newFailed.includes(id));
+            if (allSeenOrFailed) {
+              updateFields["Status"] = "completed";
+              updateFields["Completed At"] = now;
+            }
+            await airtableUpdateRecord(recId, updateFields);
+            inFlightRequests.delete(rid);
+          } else {
+            // still processing; increment attempts and maybe timeout after many tries
+            const info = requestPollInfo.get(rid) || { attempts: 0, airtableRecordId: recId };
+            info.attempts = (info.attempts || 0) + 1;
+            requestPollInfo.set(rid, info);
+            if (info.attempts > MAX_POLL_ATTEMPTS) {
+              // give up, mark as failed (timeout)
+              const now = new Date().toISOString();
+              const updateFields = {
+                "Failed IDs": (fields["Failed IDs"] ? fields["Failed IDs"] + "," : "") + rid,
+                "Seen IDs": (fields["Seen IDs"] ? fields["Seen IDs"] + "," : "") + rid,
+                "Last Update": now,
+              };
+              const newFailed = ((fields["Failed IDs"] || "").split(",").map(s => s.trim()).filter(Boolean)).concat([rid]);
+              const newSeen = ((fields["Seen IDs"] || "").split(",").map(s => s.trim()).filter(Boolean)).concat([rid]);
+              const allSeenOrFailed = reqIds.every(id => newSeen.includes(id) || newFailed.includes(id));
+              if (allSeenOrFailed) {
+                updateFields["Status"] = "completed";
+                updateFields["Completed At"] = now;
+              }
+              await airtableUpdateRecord(recId, updateFields);
+              inFlightRequests.delete(rid);
+            }
+          }
+        } catch (pollErr) {
+          console.warn("Poll err for", rid, pollErr.message);
+          // continue; retry next tick
+        } finally {
+          // small sleep to respect rate limiting
+          await sleep(250);
+        }
+      } // end reqIds loop
+    } // end records loop
+  } catch (err) {
+    console.error("pollerLoop err", err);
+  } finally {
+    // schedule next
+    setTimeout(pollerLoop, POLL_INTERVAL_MS);
+  }
+}
+
+// start poller after server boots
+setTimeout(pollerLoop, 3_000);
+
+/* ---------- Start server ---------- */
+
+app.listen(PORT, () => {
+  console.log(`Seedream Airtable app listening on port ${PORT}`);
+  console.log(`PUBLIC_BASE_URL=${PUBLIC_BASE_URL}`);
+  console.log(`Make sure WAVESPEED webhook is allowed to call ${PUBLIC_BASE_URL}/webhooks/wavespeed`);
+});
